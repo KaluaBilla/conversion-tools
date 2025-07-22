@@ -25,6 +25,11 @@ static void usage(void) {
     printf("  -v, --verbose         show conversion steps\n");
     printf("      --help            display this help and exit\n");
     printf("      --version         output version information and exit\n\n");
+    printf("Examples:\n");
+    printf("  echo '463' | %s                      # Convert decimal to factoradic\n", PROGRAM_NAME);
+    printf("  echo '34201' | %s -d                 # Convert factoradic to decimal\n", PROGRAM_NAME);
+    printf("  echo '463' | %s -v                   # Show conversion steps\n", PROGRAM_NAME);
+    printf("  %s numbers.txt                       # Convert file contents\n", PROGRAM_NAME);
 }
 
 static void version(void) {
@@ -164,33 +169,40 @@ static void factoradic_to_decimal(const char* factoradic, FILE* output) {
 
 static void process_input(FILE* input, FILE* output) {
     char line[256];
+    char clean[256];
     
     while (fgets(line, sizeof(line), input)) {
-        // Remove trailing whitespace
-        char* end = line + strlen(line) - 1;
-        while (end > line && isspace(*end)) {
-            *end = '\0';
-            end--;
-        }
+        int clean_pos = 0;
+        int found_decimal = 0;
         
-        // Skip empty lines
-        if (strlen(line) == 0) {
-            continue;
+        // Extract only numeric characters before decimal point
+        for (int i = 0; line[i] && clean_pos < sizeof(clean) - 1; i++) {
+            if (line[i] == '.' || line[i] == ',') {
+                found_decimal = 1;
+                break;  // Stop at decimal point
+            }
+            if (isdigit(line[i])) {
+                clean[clean_pos++] = line[i];
+            }
         }
+        clean[clean_pos] = '\0';
+        
+        // Skip if no digits found
+        if (clean_pos == 0) {
+          fprintf(stderr, "Error: No valid digits found in input: %s", line);
+        continue;
+}
+
         
         if (decode_mode) {
-            factoradic_to_decimal(line, output);
+            factoradic_to_decimal(clean, output);
         } else {
-            // Convert string to number
-            char* endptr;
-            unsigned long long num = strtoull(line, &endptr, 10);
-            
-            if (*endptr != '\0') {
-                fprintf(stderr, "Error: Invalid decimal number '%s'\n", line);
-                continue;
-            }
-            
+            unsigned long long num = strtoull(clean, NULL, 10);
             decimal_to_factoradic(num, output);
+        }
+        
+        if (found_decimal && verbose_mode) {
+            fprintf(stderr, "Note: Truncated fractional part, using integer portion only\n");
         }
     }
 }
