@@ -3,15 +3,20 @@
 #include <string.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 
-/*
-    printf("DNA encoding maps each 2-bit pair to nucleotides A, T, G, C\n");
-    printf("Default mapping: A=00, T=01, G=10, C=11 (can be customized with -m)\n");
-    printf("Example mappings:\n");
-    printf("  atgc: A=00, T=01, G=10, C=11 (default)\n");
-    printf("  agct: A=00, G=01, C=10, T=11 (alternative)\n");
-    printf("  cgat: C=00, G=01, A=10, T=11 (GC-rich)\n");
-*/
+#define NUCLEOTIDES_PER_BYTE 4
+#define BITS_PER_NUCLEOTIDE 2
+#define MAX_WRAP_COLS 10000
+#define BUFFER_SIZE 8192
+#define MAX_MAPPING_LEN 4
+
+// Exit codes
+#define EXIT_SUCCESS 0
+#define EXIT_INVALID_ARGS 1
+#define EXIT_FILE_ERROR 2
+#define EXIT_INVALID_DATA 3
 
 void print_usage(const char *program_name) {
     printf("Usage: %s [OPTION]... [FILE]\n", program_name);
@@ -21,10 +26,12 @@ void print_usage(const char *program_name) {
     printf("  -m, --mapping=MAP     nucleotide mapping (default: 'atgc')\n");
     printf("                        MAP is 4 chars representing 00,01,10,11 bit pairs\n");
     printf("  -w, --wrap=COLS       wrap encoded lines after COLS characters (default 80)\n");
-    printf("                        Use 0 to disable line wrapping\n");
+    printf("                        Use 0 to disable line wrapping (max %d)\n", MAX_WRAP_COLS);
     printf("  -c, --complement      use complementary base pairs for encoding\n");
     printf("      --help           display this help and exit\n");
     printf("      --version        output version information and exit\n\n");
+    printf("DNA encoding maps each 2-bit pair to nucleotides A, T, G, C\n");
+    printf("Default mapping: A=00, T=01, G=10, C=11 (can be customized with -m)\n");
 }
 
 void print_version() {
@@ -51,7 +58,7 @@ char bits_to_nucleotide(unsigned char bits, const char *mapping) {
 // Convert nucleotide to 2-bit value using mapping
 int nucleotide_to_bits(char nucleotide, const char *mapping) {
     char upper_nuc = toupper(nucleotide);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < NUCLEOTIDES_PER_BYTE; i++) {
         if (toupper(mapping[i]) == upper_nuc) {
             return i;
         }
@@ -61,13 +68,13 @@ int nucleotide_to_bits(char nucleotide, const char *mapping) {
 
 // Validate mapping string
 int validate_mapping(const char *mapping) {
-    if (strlen(mapping) != 4) {
+    if (!mapping || strlen(mapping) != MAX_MAPPING_LEN) {
         return 0;
     }
     
     // Check for valid nucleotides and no duplicates
-    char seen[256] = {0};
-    for (int i = 0; i < 4; i++) {
+    int seen[256] = {0};
+    for (int i = 0; i < MAX_MAPPING_LEN; i++) {
         char c = toupper(mapping[i]);
         if (c != 'A' && c != 'T' && c != 'G' && c != 'C') {
             return 0;
@@ -80,121 +87,164 @@ int validate_mapping(const char *mapping) {
     return 1;
 }
 
-// Encode file to DNA sequence
-void encode_dna(FILE *input, FILE *output, const char *mapping, int wrap_cols, int use_complement) {
-    int byte;
+// Safe integer parsing
+int parse_int(const char *str, int *result, int min_val, int max_val) {
+    if (!str || !result) return 0;
+    
+    char *endptr;
+    errno = 0;
+    long val = strtol(str, &endptr, 10);
+    
+    if (errno != 0 || *endptr != '\0' || val < min_val || val > max_val) {
+        return 0;
+    }
+    
+    *result = (int)val;
+    return 1;
+}
+
+// Check for write errors
+int safe_fputc(int c, FILE *stream) {
+    if (fputc(c, stream) == EOF) {
+        fprintf(stderr, "Error: write failed: %s\n", strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+// Encode file to DNA sequence with buffering
+int encode_dna(FILE *input, FILE *output, const char *mapping, int wrap_cols, int use_complement) {
+    unsigned char buffer[BUFFER_SIZE];
+    size_t bytes_read;
     int col_count = 0;
     
-    while ((byte = fgetc(input)) != EOF) {
-        // Process each byte as 4 nucleotides (2 bits each)
-        for (int i = 6; i >= 0; i -= 2) {
-            unsigned char bits = (byte >> i) & 0x03;
-            char nucleotide = bits_to_nucleotide(bits, mapping);
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), input)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            unsigned char byte = buffer[i];
             
-            if (use_complement) {
-                nucleotide = get_complement(nucleotide);
-            }
-            
-            fputc(nucleotide, output);
-            col_count++;
-            
-            // Add line wrap if specified
-            if (wrap_cols > 0 && col_count >= wrap_cols) {
-                fputc('\n', output);
-                col_count = 0;
+            // Process each byte as 4 nucleotides (2 bits each)
+            for (int shift = 6; shift >= 0; shift -= BITS_PER_NUCLEOTIDE) {
+                unsigned char bits = (byte >> shift) & 0x03;
+                char nucleotide = bits_to_nucleotide(bits, mapping);
+                
+                if (use_complement) {
+                    nucleotide = get_complement(nucleotide);
+                }
+                
+                if (!safe_fputc(nucleotide, output)) {
+                    return EXIT_FILE_ERROR;
+                }
+                col_count++;
+                
+                // Add line wrap if specified
+                if (wrap_cols > 0 && col_count >= wrap_cols) {
+                    if (!safe_fputc('\n', output)) {
+                        return EXIT_FILE_ERROR;
+                    }
+                    col_count = 0;
+                }
             }
         }
+    }
+    
+    // Check for read error
+    if (ferror(input)) {
+        fprintf(stderr, "Error: read failed: %s\n", strerror(errno));
+        return EXIT_FILE_ERROR;
     }
     
     // Add final newline if we haven't wrapped
     if (wrap_cols == 0 || col_count > 0) {
-        fputc('\n', output);
+        if (!safe_fputc('\n', output)) {
+            return EXIT_FILE_ERROR;
+        }
     }
+    
+    return EXIT_SUCCESS;
 }
 
-// Decode DNA sequence to file
-void decode_dna(FILE *input, FILE *output, const char *mapping, int use_complement) {
-    int c;
+// Decode DNA sequence to file with buffering
+int decode_dna(FILE *input, FILE *output, const char *mapping, int use_complement) {
+    char buffer[BUFFER_SIZE];
+    size_t chars_read;
     unsigned char byte = 0;
     int nucleotide_count = 0;
+    int invalid_chars = 0;
     
-    while ((c = fgetc(input)) != EOF) {
-        // Skip whitespace and newlines
-        if (isspace(c)) {
-            continue;
+    while ((chars_read = fread(buffer, 1, sizeof(buffer), input)) > 0) {
+        for (size_t i = 0; i < chars_read; i++) {
+            char c = buffer[i];
+            
+            // Skip whitespace and newlines
+            if (isspace(c)) {
+                continue;
+            }
+            
+            char nucleotide = c;
+            if (use_complement) {
+                nucleotide = get_complement(nucleotide);
+            }
+            
+            int bits = nucleotide_to_bits(nucleotide, mapping);
+            if (bits < 0) {
+                invalid_chars++;
+                if (invalid_chars <= 10) {  // Limit error messages
+                    fprintf(stderr, "Warning: ignoring invalid nucleotide '%c' at position %zu\n", 
+                           c, ftell(input) - chars_read + i);
+                }
+                continue;
+            }
+            
+            // Pack 2 bits into byte (4 nucleotides = 1 byte)
+            byte = (byte << BITS_PER_NUCLEOTIDE) | bits;
+            nucleotide_count++;
+            
+            // When we have 4 nucleotides (8 bits), output the byte
+            if (nucleotide_count == NUCLEOTIDES_PER_BYTE) {
+                if (fputc(byte, output) == EOF) {
+                    fprintf(stderr, "Error: write failed: %s\n", strerror(errno));
+                    return EXIT_FILE_ERROR;
+                }
+                byte = 0;
+                nucleotide_count = 0;
+            }
         }
-        
-        char nucleotide = c;
-        if (use_complement) {
-            nucleotide = get_complement(nucleotide);
-        }
-        
-        int bits = nucleotide_to_bits(nucleotide, mapping);
-        if (bits < 0) {
-            fprintf(stderr, "Warning: ignoring invalid nucleotide '%c'\n", c);
-            continue;
-        }
-        
-        // Pack 2 bits into byte (4 nucleotides = 1 byte)
-        byte = (byte << 2) | bits;
-        nucleotide_count++;
-        
-        // When we have 4 nucleotides (8 bits), output the byte
-        if (nucleotide_count == 4) {
-            fputc(byte, output);
-            byte = 0;
-            nucleotide_count = 0;
-        }
+    }
+    
+    // Check for read error
+    if (ferror(input)) {
+        fprintf(stderr, "Error: read failed: %s\n", strerror(errno));
+        return EXIT_FILE_ERROR;
     }
     
     // Handle incomplete byte
     if (nucleotide_count > 0) {
         // Left-shift remaining bits to complete the byte
-        byte <<= (2 * (4 - nucleotide_count));
-        fputc(byte, output);
-        fprintf(stderr, "Warning: incomplete DNA sequence, padded with zeros\n");
-    }
-}
-
-// Display mapping information
-void show_mapping_info(const char *mapping) {
-    printf("DNA mapping being used:\n");
-    const char *bit_patterns[] = {"00", "01", "10", "11"};
-    for (int i = 0; i < 4; i++) {
-        printf("  %s -> %c\n", bit_patterns[i], toupper(mapping[i]));
-    }
-    printf("\n");
-}
-
-// Calculate and display statistics
-void calculate_gc_content(const char *sequence) {
-    int total = 0, gc_count = 0;
-    
-    for (const char *p = sequence; *p; p++) {
-        char c = toupper(*p);
-        if (c == 'A' || c == 'T' || c == 'G' || c == 'C') {
-            total++;
-            if (c == 'G' || c == 'C') {
-                gc_count++;
-            }
+        byte <<= (BITS_PER_NUCLEOTIDE * (NUCLEOTIDES_PER_BYTE - nucleotide_count));
+        if (fputc(byte, output) == EOF) {
+            fprintf(stderr, "Error: write failed: %s\n", strerror(errno));
+            return EXIT_FILE_ERROR;
         }
+        fprintf(stderr, "Warning: incomplete DNA sequence (%d nucleotides), padded with zeros\n", 
+               nucleotide_count);
     }
     
-    if (total > 0) {
-        double gc_percent = (double)gc_count / total * 100.0;
-        fprintf(stderr, "Sequence stats: %d nucleotides, %.1f%% GC content\n", total, gc_percent);
+    if (invalid_chars > 10) {
+        fprintf(stderr, "Warning: %d total invalid characters ignored\n", invalid_chars);
     }
+    
+    return EXIT_SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
     int decode_mode = 0;
     int wrap_cols = 80;  // Default wrap for DNA sequences
     int use_complement = 0;
-    int show_stats = 0;
-    char mapping[5] = "atgc";  // Default mapping: A=00, T=01, G=10, C=11
+    char mapping[MAX_MAPPING_LEN + 1] = "atgc";  // Default mapping: A=00, T=01, G=10, C=11
     const char *filename = NULL;
     FILE *input = stdin;
     FILE *output = stdout;
+    int result = EXIT_SUCCESS;
     
     // Parse command line options
     static struct option long_options[] = {
@@ -202,14 +252,13 @@ int main(int argc, char *argv[]) {
         {"mapping", required_argument, 0, 'm'},
         {"wrap", required_argument, 0, 'w'},
         {"complement", no_argument, 0, 'c'},
-        {"stats", no_argument, 0, 's'},
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'v'},
         {0, 0, 0, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "dm:w:cshv", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dm:w:chv", long_options, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 decode_mode = 1;
@@ -217,66 +266,68 @@ int main(int argc, char *argv[]) {
             case 'm':
                 if (!validate_mapping(optarg)) {
                     fprintf(stderr, "Error: invalid mapping '%s'. Must be 4 unique nucleotides (A,T,G,C)\n", optarg);
-                    return 1;
+                    return EXIT_INVALID_ARGS;
                 }
-                strncpy(mapping, optarg, 4);
-                mapping[4] = '\0';
+                strncpy(mapping, optarg, MAX_MAPPING_LEN);
+                mapping[MAX_MAPPING_LEN] = '\0';
                 break;
             case 'w':
-                wrap_cols = atoi(optarg);
-                if (wrap_cols < 0) {
-                    fprintf(stderr, "Error: wrap columns must be >= 0\n");
-                    return 1;
+                if (!parse_int(optarg, &wrap_cols, 0, MAX_WRAP_COLS)) {
+                    fprintf(stderr, "Error: invalid wrap columns '%s'. Must be 0-%d\n", 
+                           optarg, MAX_WRAP_COLS);
+                    return EXIT_INVALID_ARGS;
                 }
                 break;
             case 'c':
                 use_complement = 1;
                 break;
-            case 's':
-                show_stats = 1;
-                break;
             case 'h':
                 print_usage(argv[0]);
-                return 0;
+                return EXIT_SUCCESS;
             case 'v':
                 print_version();
-                return 0;
+                return EXIT_SUCCESS;
             default:
-                print_usage(argv[0]);
-                return 1;
+                fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+                return EXIT_INVALID_ARGS;
         }
-    }
-    
-    // Show mapping information if requested
-    if (show_stats && !decode_mode) {
-        show_mapping_info(mapping);
     }
     
     // Get filename if provided
     if (optind < argc) {
         filename = argv[optind];
+        if (optind + 1 < argc) {
+            fprintf(stderr, "Error: too many arguments\n");
+            return EXIT_INVALID_ARGS;
+        }
     }
     
     // Open input file (or use stdin)
     if (filename && strcmp(filename, "-") != 0) {
         input = fopen(filename, "rb");
         if (!input) {
-            perror("Error opening input file");
-            return 1;
+            fprintf(stderr, "Error: cannot open '%s': %s\n", filename, strerror(errno));
+            return EXIT_FILE_ERROR;
         }
     }
     
     // Do the conversion
     if (decode_mode) {
-        decode_dna(input, output, mapping, use_complement);
+        result = decode_dna(input, output, mapping, use_complement);
     } else {
-        encode_dna(input, output, mapping, wrap_cols, use_complement);
+        result = encode_dna(input, output, mapping, wrap_cols, use_complement);
+    }
+    
+    // Ensure output is flushed
+    if (fflush(output) != 0) {
+        fprintf(stderr, "Error: failed to flush output: %s\n", strerror(errno));
+        result = EXIT_FILE_ERROR;
     }
     
     // Cleanup
-    if (input != stdin) {
-        fclose(input);
+    if (input != stdin && fclose(input) != 0) {
+        fprintf(stderr, "Warning: failed to close input file: %s\n", strerror(errno));
     }
     
-    return 0;
+    return result;
 }
