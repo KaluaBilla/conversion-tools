@@ -86,6 +86,7 @@ static void usage(void) {
     printf("  -c, --compact         use compact single-line representations\n");
     printf("      --help            display this help and exit\n");
     printf("      --version         output version information and exit\n\n");
+}
 
 static void version(void) {
     printf("%s %s\n", PROGRAM_NAME, VERSION);
