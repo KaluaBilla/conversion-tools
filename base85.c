@@ -8,11 +8,12 @@
 #include <limits.h>
 
 #define PROGRAM_NAME "base85"
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 #define DEFAULT_WRAP 76
 #define ENCODE_CHUNK 4
 #define DECODE_CHUNK 5
 #define MAX_WRAP 1000000
+#define BUFFER_SIZE 8192
 
 // Z85 character set (ZeroMQ Base85 - RFC standard)
 static const char z85_alphabet[] = 
@@ -75,6 +76,10 @@ static void print_version(void) {
 static int parse_wrap_value(const char *str, int *wrap) {
     char *endptr;
     long val;
+    
+    if (str == NULL || *str == '\0') {
+        return -1;
+    }
     
     errno = 0;
     val = strtol(str, &endptr, 10);
@@ -159,68 +164,98 @@ static FILE* open_input_file(const char *filename) {
 }
 
 static int encode_z85(FILE *input, FILE *output, int wrap) {
-    uint8_t buffer[ENCODE_CHUNK];
-    size_t bytes_read;
-    int column = 0;
+    uint8_t *buffer = NULL;
+    char *output_buffer = NULL;
     int result = 0;
+    int column = 0;
     
-    while ((bytes_read = fread(buffer, 1, ENCODE_CHUNK, input)) > 0) {
+    // Allocate buffers
+    buffer = malloc(BUFFER_SIZE);
+    output_buffer = malloc(BUFFER_SIZE * 2); // Extra space for encoding expansion
+    if (buffer == NULL || output_buffer == NULL) {
+        print_error("memory allocation failed");
+        result = 1;
+        goto cleanup;
+    }
+    
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, input)) > 0) {
         // Check for read errors
-        if (bytes_read != ENCODE_CHUNK && ferror(input)) {
+        if (bytes_read != BUFFER_SIZE && ferror(input)) {
             print_error("read error");
             result = 1;
-            break;
+            goto cleanup;
         }
         
-        // Pad incomplete blocks with zeros
-        if (bytes_read < ENCODE_CHUNK) {
-            memset(buffer + bytes_read, 0, ENCODE_CHUNK - bytes_read);
+        size_t output_pos = 0;
+        for (size_t pos = 0; pos < bytes_read; pos += ENCODE_CHUNK) {
+            uint8_t chunk[ENCODE_CHUNK] = {0};
+            size_t chunk_size = (pos + ENCODE_CHUNK <= bytes_read) ? 
+                               ENCODE_CHUNK : bytes_read - pos;
+            
+            memcpy(chunk, buffer + pos, chunk_size);
+            
+            uint32_t value = 0;
+            for (size_t i = 0; i < ENCODE_CHUNK; i++) {
+                value = (value << 8) | chunk[i];
+            }
+            
+            char encoded[DECODE_CHUNK];
+            for (int i = DECODE_CHUNK - 1; i >= 0; i--) {
+                encoded[i] = z85_alphabet[value % 85];
+                value /= 85;
+            }
+            
+            // Determine output length
+            size_t output_len = (chunk_size == ENCODE_CHUNK) ? 
+                               DECODE_CHUNK : chunk_size + 1;
+            
+            // Add to output buffer with wrapping
+            for (size_t i = 0; i < output_len; i++) {
+                if (output_pos >= BUFFER_SIZE * 2 - 10) {
+                    // Flush buffer if getting full
+                    if (fwrite(output_buffer, 1, output_pos, output) != output_pos) {
+                        print_error("write error");
+                        result = 1;
+                        goto cleanup;
+                    }
+                    output_pos = 0;
+                }
+                
+                output_buffer[output_pos++] = encoded[i];
+                column++;
+                
+                if (wrap > 0 && column >= wrap) {
+                    output_buffer[output_pos++] = '\n';
+                    column = 0;
+                }
+            }
         }
         
-        // Pack 4 bytes into 32-bit value (big-endian)
-        uint32_t value = 0;
-        for (size_t i = 0; i < ENCODE_CHUNK; i++) {
-            value = (value << 8) | buffer[i];
-        }
-        
-        // Convert to base85 (5 characters)
-        char encoded[DECODE_CHUNK];
-        for (int i = DECODE_CHUNK - 1; i >= 0; i--) {
-            encoded[i] = z85_alphabet[value % 85];
-            value /= 85;
-        }
-        
-        // Output the appropriate number of characters
-        size_t output_len = (bytes_read == ENCODE_CHUNK) ? DECODE_CHUNK : bytes_read + 1;
-        for (size_t i = 0; i < output_len; i++) {
-            if (fputc(encoded[i], output) == EOF) {
+        // Flush output buffer
+        if (output_pos > 0) {
+            if (fwrite(output_buffer, 1, output_pos, output) != output_pos) {
                 print_error("write error");
                 result = 1;
                 goto cleanup;
             }
-            
-            column++;
-            if (wrap > 0 && column >= wrap) {
-                if (fputc('\n', output) == EOF) {
-                    print_error("write error");
-                    result = 1;
-                    goto cleanup;
-                }
-                column = 0;
-            }
         }
     }
     
-    // Add final newline if wrapping is enabled and we're not at start of line
+    // Add final newline if needed
     if (wrap > 0 && column > 0) {
         if (fputc('\n', output) == EOF) {
             print_error("write error");
             result = 1;
+            goto cleanup;
         }
     }
 
 cleanup:
-    if (fflush(output) != 0) {
+    free(buffer);
+    free(output_buffer);
+    
+    if (result == 0 && fflush(output) != 0) {
         print_error("write error");
         result = 1;
     }
@@ -229,47 +264,68 @@ cleanup:
 }
 
 static int decode_z85(FILE *input, FILE *output, int ignore_garbage) {
-    int c;
+    char *input_buffer = NULL;
+    uint8_t *output_buffer = NULL;
+    int result = 0;
     uint32_t value = 0;
     int count = 0;
-    int result = 0;
     
-    while ((c = fgetc(input)) != EOF) {
-        // Skip whitespace
-        if (isspace(c)) {
-            continue;
-        }
-        
-        // Validate character
-        if (c < 0 || c > 255 || z85_decoder[c] == -1) {
-            if (ignore_garbage) {
+    // Allocate buffers
+    input_buffer = malloc(BUFFER_SIZE);
+    output_buffer = malloc(BUFFER_SIZE);
+    if (input_buffer == NULL || output_buffer == NULL) {
+        print_error("memory allocation failed");
+        result = 1;
+        goto cleanup;
+    }
+    
+    size_t bytes_read;
+    size_t output_pos = 0;
+    
+    while ((bytes_read = fread(input_buffer, 1, BUFFER_SIZE, input)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            int c = (unsigned char)input_buffer[i];
+            
+            // Skip whitespace
+            if (isspace(c)) {
                 continue;
             }
-            fprintf(stderr, "%s: invalid character in input: '%c' (0x%02x)\n", 
-                    PROGRAM_NAME, isprint(c) ? c : '?', (unsigned char)c);
-            return 1;
-        }
-        
-        // Accumulate value
-        value = value * 85 + z85_decoder[c];
-        count++;
-        
-        if (count == DECODE_CHUNK) {
-            // Output 4 bytes (big-endian)
-            uint8_t bytes[ENCODE_CHUNK];
-            for (int i = ENCODE_CHUNK - 1; i >= 0; i--) {
-                bytes[i] = value & 0xFF;
-                value >>= 8;
-            }
             
-            if (fwrite(bytes, 1, ENCODE_CHUNK, output) != ENCODE_CHUNK) {
-                print_error("write error");
+            // Validate character
+            if (c < 0 || c > 255 || z85_decoder[c] == -1) {
+                if (ignore_garbage) {
+                    continue;
+                }
+                fprintf(stderr, "%s: invalid character in input: '%c' (0x%02x)\n", 
+                        PROGRAM_NAME, isprint(c) ? c : '?', (unsigned char)c);
                 result = 1;
-                break;
+                goto cleanup;
             }
             
-            value = 0;
-            count = 0;
+            // Accumulate value
+            value = value * 85 + z85_decoder[c];
+            count++;
+            
+            if (count == DECODE_CHUNK) {
+
+                if (output_pos + ENCODE_CHUNK >= BUFFER_SIZE) {
+                    if (fwrite(output_buffer, 1, output_pos, output) != output_pos) {
+                        print_error("write error");
+                        result = 1;
+                        goto cleanup;
+                    }
+                    output_pos = 0;
+                }
+                
+                for (int j = ENCODE_CHUNK - 1; j >= 0; j--) {
+                    output_buffer[output_pos + j] = value & 0xFF;
+                    value >>= 8;
+                }
+                output_pos += ENCODE_CHUNK;
+                
+                value = 0;
+                count = 0;
+            }
         }
     }
     
@@ -277,30 +333,47 @@ static int decode_z85(FILE *input, FILE *output, int ignore_garbage) {
     if (count > 0) {
         if (count == 1) {
             print_error("invalid input: incomplete final group");
-            return 1;
+            result = 1;
+            goto cleanup;
         }
         
-        // Pad with the highest value character ('z' in Z85)
+        // Pad with the highest value character ('$' in Z85 = 84)
         while (count < DECODE_CHUNK) {
-            value = value * 85 + 84;  // 84 is the value of 'z'
+            value = value * 85 + 84;
             count++;
         }
         
-        // Output appropriate number of bytes
-        int output_bytes = count - 1;  // n encoded chars = n-1 decoded bytes
-        uint8_t bytes[ENCODE_CHUNK];
-        for (int i = ENCODE_CHUNK - 1; i >= 0; i--) {
-            bytes[i] = value & 0xFF;
-            value >>= 8;
+
+        int output_bytes = count - 1;
+        if (output_pos + output_bytes >= BUFFER_SIZE) {
+            if (fwrite(output_buffer, 1, output_pos, output) != output_pos) {
+                print_error("write error");
+                result = 1;
+                goto cleanup;
+            }
+            output_pos = 0;
         }
         
-        if (fwrite(bytes, 1, output_bytes, output) != (size_t)output_bytes) {
+        for (int i = output_bytes - 1; i >= 0; i--) {
+            output_buffer[output_pos + i] = value & 0xFF;
+            value >>= 8;
+        }
+        output_pos += output_bytes;
+    }
+    
+    // Flush remaining output
+    if (output_pos > 0) {
+        if (fwrite(output_buffer, 1, output_pos, output) != output_pos) {
             print_error("write error");
             result = 1;
         }
     }
+
+cleanup:
+    free(input_buffer);
+    free(output_buffer);
     
-    if (fflush(output) != 0) {
+    if (result == 0 && fflush(output) != 0) {
         print_error("write error");
         result = 1;
     }
