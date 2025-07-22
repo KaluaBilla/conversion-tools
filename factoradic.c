@@ -25,12 +25,7 @@ static void usage(void) {
     printf("  -v, --verbose         show conversion steps\n");
     printf("      --help            display this help and exit\n");
     printf("      --version         output version information and exit\n\n");
-    printf("Examples:\n");
-    printf("  echo '463' | %s                      # Convert decimal to factoradic\n", PROGRAM_NAME);
-    printf("  echo '34201' | %s -d                 # Convert factoradic to decimal\n", PROGRAM_NAME);
-    printf("  echo '463' | %s -v                   # Show conversion steps\n", PROGRAM_NAME);
-    printf("  %s numbers.txt                       # Convert file contents\n", PROGRAM_NAME);
-}
+}    
 
 static void version(void) {
     printf("%s %s\n", PROGRAM_NAME, VERSION);
