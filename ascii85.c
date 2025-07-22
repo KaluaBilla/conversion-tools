@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
+#include <ctype.h>
 
 #define ASCII85_GROUP_SIZE 4
 #define ASCII85_ENCODED_SIZE 5
