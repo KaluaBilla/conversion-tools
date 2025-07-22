@@ -5,44 +5,42 @@
 #include <ctype.h>
 #include <wchar.h>
 #include <locale.h>
+#include <errno.h>
+#include <limits.h>
 
-// Braille Unicode characters start at U+2800
 #define BRAILLE_BASE 0x2800
+#define BRAILLE_CAPITAL 0x20
+#define BRAILLE_NUMBER 0x3C
+#define MAX_LINE_LENGTH 8192
+#define PATTERN_LENGTH 6
 
-// Braille dot patterns (6-dot system)
-// Dots are numbered: 1 4
-//                   2 5  
-//                   3 6
-// Each bit represents a dot (bit 0 = dot 1, bit 1 = dot 2, etc.)
 typedef struct {
     char character;
     unsigned char pattern;
 } BrailleEntry;
 
-// Standard Braille patterns (Grade 1 Braille)
 static const BrailleEntry braille_table[] = {
-    // Letters (a-z)
     {'A', 0x01}, {'B', 0x03}, {'C', 0x09}, {'D', 0x19}, {'E', 0x11}, {'F', 0x0B},
     {'G', 0x1B}, {'H', 0x13}, {'I', 0x0A}, {'J', 0x1A}, {'K', 0x05}, {'L', 0x07},
     {'M', 0x0D}, {'N', 0x1D}, {'O', 0x15}, {'P', 0x0F}, {'Q', 0x1F}, {'R', 0x17},
     {'S', 0x0E}, {'T', 0x1E}, {'U', 0x25}, {'V', 0x27}, {'W', 0x3A}, {'X', 0x2D},
     {'Y', 0x3D}, {'Z', 0x35},
-    
-    // Numbers (use number prefix # then letters a-j for 1-0)
     {'1', 0x01}, {'2', 0x03}, {'3', 0x09}, {'4', 0x19}, {'5', 0x11},
     {'6', 0x0B}, {'7', 0x1B}, {'8', 0x13}, {'9', 0x0A}, {'0', 0x1A},
-    
-    // Common punctuation
     {'.', 0x2C}, {',', 0x02}, {'?', 0x26}, {'!', 0x16}, {';', 0x06}, 
     {':', 0x12}, {'-', 0x24}, {'\'', 0x04}, {'"', 0x10}, {'(', 0x2E}, 
-    {')', 0x2E}, {'/', 0x0C}, {' ', 0x00},  // Space is empty pattern
-    
-    {'\0', 0}  // End marker
+    {')', 0x2E}, {'/', 0x0C}, {' ', 0x00},
+    {'\0', 0}
 };
 
-// Special Braille indicators
-#define BRAILLE_CAPITAL    0x20  // Capital letter indicator (dot 6)
-#define BRAILLE_NUMBER     0x3C  // Number indicator (dots 3,4,5,6)
+typedef enum {
+    RESULT_SUCCESS = 0,
+    RESULT_ERROR_FILE,
+    RESULT_ERROR_MEMORY,
+    RESULT_ERROR_ARGS,
+    RESULT_ERROR_IO,
+    RESULT_ERROR_ENCODING
+} result_t;
 
 void print_usage(const char *program_name) {
     printf("Usage: %s [OPTION]... [FILE]\n", program_name);
@@ -52,164 +50,222 @@ void print_usage(const char *program_name) {
     printf("  -t, --text-braille    use text representation (dots/spaces) instead of unicode\n");
     printf("      --help           display this help and exit\n");
     printf("      --version        output version information and exit\n\n");
-    printf("Encoding: Converts readable text to braille unicode characters\n");
-    printf("Decoding: Converts braille unicode back to text\n");
-    printf("Text mode: Uses 6-character patterns with 'o' for raised dots, '.' for empty\n");
-    printf("Supported: A-Z, a-z, 0-9, and common punctuation marks\n");
+    printf("Examples:\n");
+    printf("  %s file.txt          # encode text to braille\n", program_name);
+    printf("  %s -d braille.txt    # decode braille to text\n", program_name);
+    printf("  echo 'Hello' | %s -t # encode using text mode\n", program_name);
 }
 
-void print_version() {
-    printf("braille 1.0\n");
-    printf("Simple braille encoder/decoder (Grade 1 Braille)\n");
+void print_version(void) {
+    printf("braille 2.0\n");
+    printf("Production-grade braille encoder/decoder (Grade 1 Braille)\n");
 }
 
-// Find braille pattern for a character
-unsigned char char_to_braille(char c) {
-    char upper_c = toupper(c);
-    for (int i = 0; braille_table[i].character != '\0'; i++) {
+static unsigned char char_to_braille(char c) {
+    char upper_c = (char)toupper((unsigned char)c);
+    for (size_t i = 0; braille_table[i].character != '\0'; i++) {
         if (braille_table[i].character == upper_c) {
             return braille_table[i].pattern;
         }
     }
-    return 0xFF;  // Not found marker
+    return 0xFF;
 }
 
-// Find character for braille pattern
-char braille_to_char(unsigned char pattern, int is_number, int is_capital) {
-    for (int i = 0; braille_table[i].character != '\0'; i++) {
+static char braille_to_char(unsigned char pattern, int is_number, int is_capital) {
+    for (size_t i = 0; braille_table[i].character != '\0'; i++) {
         if (braille_table[i].pattern == pattern) {
             char c = braille_table[i].character;
             if (is_number && c >= 'A' && c <= 'J') {
-                // Convert A-J to 1-0 for numbers
                 return (c == 'J') ? '0' : ('1' + (c - 'A'));
             }
-            return is_capital ? c : tolower(c);
+            return is_capital ? c : (char)tolower((unsigned char)c);
         }
     }
-    return '?';  // Pattern not found
+    return '?';
 }
 
-// Convert pattern to text representation (6 dots arranged in 2x3)
-void pattern_to_text(unsigned char pattern, char *output) {
-    // Arrangement: 1 4
-    //              2 5
-    //              3 6
-    output[0] = (pattern & 0x01) ? 'o' : '.';  // dot 1
-    output[1] = (pattern & 0x08) ? 'o' : '.';  // dot 4
-    output[2] = (pattern & 0x02) ? 'o' : '.';  // dot 2
-    output[3] = (pattern & 0x10) ? 'o' : '.';  // dot 5
-    output[4] = (pattern & 0x04) ? 'o' : '.';  // dot 3
-    output[5] = (pattern & 0x20) ? 'o' : '.';  // dot 6
-    output[6] = '\0';
-}
-
-// Convert text representation back to pattern
-unsigned char text_to_pattern(const char *text) {
-    unsigned char pattern = 0;
-    if (strlen(text) >= 6) {
-        if (text[0] == 'o') pattern |= 0x01;  // dot 1
-        if (text[1] == 'o') pattern |= 0x08;  // dot 4
-        if (text[2] == 'o') pattern |= 0x02;  // dot 2
-        if (text[3] == 'o') pattern |= 0x10;  // dot 5
-        if (text[4] == 'o') pattern |= 0x04;  // dot 3
-        if (text[5] == 'o') pattern |= 0x20;  // dot 6
+static result_t pattern_to_text(unsigned char pattern, char *output, size_t output_size) {
+    if (output == NULL || output_size < PATTERN_LENGTH + 1) {
+        return RESULT_ERROR_ARGS;
     }
+    
+    output[0] = (pattern & 0x01) ? 'o' : '.';
+    output[1] = (pattern & 0x08) ? 'o' : '.';
+    output[2] = (pattern & 0x02) ? 'o' : '.';
+    output[3] = (pattern & 0x10) ? 'o' : '.';
+    output[4] = (pattern & 0x04) ? 'o' : '.';
+    output[5] = (pattern & 0x20) ? 'o' : '.';
+    output[6] = '\0';
+    
+    return RESULT_SUCCESS;
+}
+
+static unsigned char text_to_pattern(const char *text) {
+    if (text == NULL || strlen(text) < PATTERN_LENGTH) {
+        return 0;
+    }
+    
+    unsigned char pattern = 0;
+    if (text[0] == 'o') pattern |= 0x01;
+    if (text[1] == 'o') pattern |= 0x08;
+    if (text[2] == 'o') pattern |= 0x02;
+    if (text[3] == 'o') pattern |= 0x10;
+    if (text[4] == 'o') pattern |= 0x04;
+    if (text[5] == 'o') pattern |= 0x20;
+    
     return pattern;
 }
 
-// Encode text to braille
-void encode_braille(FILE *input, FILE *output, int text_mode) {
+static result_t write_pattern(FILE *output, unsigned char pattern, int text_mode) {
+    if (output == NULL) {
+        return RESULT_ERROR_ARGS;
+    }
+    
+    if (text_mode) {
+        char text_repr[PATTERN_LENGTH + 1];
+        result_t result = pattern_to_text(pattern, text_repr, sizeof(text_repr));
+        if (result != RESULT_SUCCESS) {
+            return result;
+        }
+        if (fprintf(output, "%s", text_repr) < 0) {
+            return RESULT_ERROR_IO;
+        }
+    } else {
+        wint_t braille_char = BRAILLE_BASE + pattern;
+        if (fputwc(braille_char, output) == WEOF) {
+            return RESULT_ERROR_IO;
+        }
+    }
+    
+    return RESULT_SUCCESS;
+}
+
+static result_t encode_braille(FILE *input, FILE *output, int text_mode) {
+    if (input == NULL || output == NULL) {
+        return RESULT_ERROR_ARGS;
+    }
+    
     int c;
     int number_mode = 0;
+    size_t line_length = 0;
     
     while ((c = fgetc(input)) != EOF) {
+        if (ferror(input)) {
+            fprintf(stderr, "Error reading input\n");
+            return RESULT_ERROR_IO;
+        }
+        
         if (c == '\n') {
-            fprintf(output, "\n");
+            if (fputc('\n', output) == EOF) {
+                return RESULT_ERROR_IO;
+            }
             number_mode = 0;
+            line_length = 0;
             continue;
         }
         
-        unsigned char pattern = char_to_braille(c);
+        // Prevent extremely long lines
+        if (line_length > MAX_LINE_LENGTH) {
+            fprintf(stderr, "Warning: line too long, truncating\n");
+            continue;
+        }
         
+        unsigned char pattern = char_to_braille((char)c);
         if (pattern == 0xFF) {
-            // Unsupported character
-            fprintf(stderr, "Warning: skipping unsupported character '%c' (0x%02X)\n", 
-                    isprint(c) ? c : '?', (unsigned char)c);
+            if (isprint(c)) {
+                fprintf(stderr, "Warning: skipping unsupported character '%c'\n", c);
+            } else {
+                fprintf(stderr, "Warning: skipping unsupported character (0x%02X)\n", (unsigned char)c);
+            }
             continue;
         }
         
         // Handle numbers
         if (isdigit(c) && !number_mode) {
-            // Need number indicator
-            if (text_mode) {
-                char text_repr[7];
-                pattern_to_text(BRAILLE_NUMBER, text_repr);
-                fprintf(output, "%s", text_repr);
-            } else {
-                fprintf(output, "%lc", (wint_t)(BRAILLE_BASE + BRAILLE_NUMBER));
+            result_t result = write_pattern(output, BRAILLE_NUMBER, text_mode);
+            if (result != RESULT_SUCCESS) {
+                return result;
             }
             number_mode = 1;
+            line_length++;
         } else if (!isdigit(c) && c != ' ') {
             number_mode = 0;
         }
         
         // Handle capital letters
         if (isupper(c) && isalpha(c)) {
-            if (text_mode) {
-                char text_repr[7];
-                pattern_to_text(BRAILLE_CAPITAL, text_repr);
-                fprintf(output, "%s", text_repr);
-            } else {
-                fprintf(output, "%lc", (wint_t)(BRAILLE_BASE + BRAILLE_CAPITAL));
+            result_t result = write_pattern(output, BRAILLE_CAPITAL, text_mode);
+            if (result != RESULT_SUCCESS) {
+                return result;
             }
+            line_length++;
         }
         
-        // Output the character pattern
-        if (text_mode) {
-            char text_repr[7];
-            pattern_to_text(pattern, text_repr);
-            fprintf(output, "%s", text_repr);
-        } else {
-            fprintf(output, "%lc", (wint_t)(BRAILLE_BASE + pattern));
+        // Write character pattern
+        result_t result = write_pattern(output, pattern, text_mode);
+        if (result != RESULT_SUCCESS) {
+            return result;
         }
+        line_length++;
     }
     
-    fprintf(output, "\n");
+    if (fputc('\n', output) == EOF) {
+        return RESULT_ERROR_IO;
+    }
+    
+    return RESULT_SUCCESS;
 }
 
-// Decode braille to text
-void decode_braille(FILE *input, FILE *output, int text_mode) {
+static result_t decode_braille(FILE *input, FILE *output, int text_mode) {
+    if (input == NULL || output == NULL) {
+        return RESULT_ERROR_ARGS;
+    }
+    
     if (text_mode) {
-        // Text mode: read 6-character patterns
-        char buffer[7];
+        char buffer[PATTERN_LENGTH + 1];
         int pos = 0;
         int c;
         int number_mode = 0;
         int capital_next = 0;
+        size_t line_length = 0;
         
         while ((c = fgetc(input)) != EOF) {
+            if (ferror(input)) {
+                fprintf(stderr, "Error reading input\n");
+                return RESULT_ERROR_IO;
+            }
+            
             if (c == '\n') {
-                if (pos > 0) {
-                    // Process remaining pattern
-                    buffer[pos] = '\0';
-                    if (pos == 6) {
-                        unsigned char pattern = text_to_pattern(buffer);
-                        char decoded = braille_to_char(pattern, number_mode, capital_next);
-                        fputc(decoded, output);
+                if (pos > 0 && pos == PATTERN_LENGTH) {
+                    buffer[PATTERN_LENGTH] = '\0';
+                    unsigned char pattern = text_to_pattern(buffer);
+                    char decoded = braille_to_char(pattern, number_mode, capital_next);
+                    if (fputc(decoded, output) == EOF) {
+                        return RESULT_ERROR_IO;
                     }
-                    pos = 0;
                 }
-                fprintf(output, "\n");
+                if (fputc('\n', output) == EOF) {
+                    return RESULT_ERROR_IO;
+                }
+                pos = 0;
                 number_mode = 0;
                 capital_next = 0;
+                line_length = 0;
+                continue;
+            }
+            
+            if (line_length > MAX_LINE_LENGTH) {
+                fprintf(stderr, "Warning: line too long, truncating\n");
                 continue;
             }
             
             if (c == 'o' || c == '.') {
-                buffer[pos++] = c;
+                if (pos < PATTERN_LENGTH) {
+                    buffer[pos++] = (char)c;
+                }
                 
-                if (pos == 6) {
-                    buffer[6] = '\0';
+                if (pos == PATTERN_LENGTH) {
+                    buffer[PATTERN_LENGTH] = '\0';
                     unsigned char pattern = text_to_pattern(buffer);
                     
                     if (pattern == BRAILLE_NUMBER) {
@@ -218,7 +274,9 @@ void decode_braille(FILE *input, FILE *output, int text_mode) {
                         capital_next = 1;
                     } else {
                         char decoded = braille_to_char(pattern, number_mode, capital_next);
-                        fputc(decoded, output);
+                        if (fputc(decoded, output) == EOF) {
+                            return RESULT_ERROR_IO;
+                        }
                         if (!isdigit(decoded) && decoded != ' ') {
                             number_mode = 0;
                         }
@@ -226,24 +284,38 @@ void decode_braille(FILE *input, FILE *output, int text_mode) {
                     }
                     pos = 0;
                 }
+                line_length++;
             }
         }
     } else {
-        // Unicode mode: read braille unicode characters
         wint_t wc;
         int number_mode = 0;
         int capital_next = 0;
+        size_t line_length = 0;
         
         while ((wc = fgetwc(input)) != WEOF) {
+            if (ferror(input)) {
+                fprintf(stderr, "Error reading input\n");
+                return RESULT_ERROR_IO;
+            }
+            
             if (wc == L'\n') {
-                fprintf(output, "\n");
+                if (fputc('\n', output) == EOF) {
+                    return RESULT_ERROR_IO;
+                }
                 number_mode = 0;
                 capital_next = 0;
+                line_length = 0;
+                continue;
+            }
+            
+            if (line_length > MAX_LINE_LENGTH) {
+                fprintf(stderr, "Warning: line too long, truncating\n");
                 continue;
             }
             
             if (wc >= BRAILLE_BASE && wc <= BRAILLE_BASE + 0x3F) {
-                unsigned char pattern = wc - BRAILLE_BASE;
+                unsigned char pattern = (unsigned char)(wc - BRAILLE_BASE);
                 
                 if (pattern == BRAILLE_NUMBER) {
                     number_mode = 1;
@@ -251,30 +323,42 @@ void decode_braille(FILE *input, FILE *output, int text_mode) {
                     capital_next = 1;
                 } else {
                     char decoded = braille_to_char(pattern, number_mode, capital_next);
-                    fputc(decoded, output);
+                    if (fputc(decoded, output) == EOF) {
+                        return RESULT_ERROR_IO;
+                    }
                     if (!isdigit(decoded) && decoded != ' ') {
                         number_mode = 0;
                     }
                     capital_next = 0;
                 }
+                line_length++;
             }
         }
     }
     
-    fprintf(output, "\n");
+    if (fputc('\n', output) == EOF) {
+        return RESULT_ERROR_IO;
+    }
+    
+    return RESULT_SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
+    if (argc == 0 || argv == NULL) {
+        return RESULT_ERROR_ARGS;
+    }
+    
     int decode_mode = 0;
     int text_mode = 0;
     const char *filename = NULL;
-    FILE *input = stdin;
+    FILE *input = NULL;
     FILE *output = stdout;
+    result_t result = RESULT_SUCCESS;
     
-    // Set locale for wide character support
-    setlocale(LC_ALL, "");
+    if (setlocale(LC_ALL, "") == NULL) {
+        fprintf(stderr, "Warning: could not set locale\n");
+    }
     
-    // Parse command line options
     static struct option long_options[] = {
         {"decode", no_argument, 0, 'd'},
         {"text-braille", no_argument, 0, 't'},
@@ -294,41 +378,59 @@ int main(int argc, char *argv[]) {
                 break;
             case 'h':
                 print_usage(argv[0]);
-                return 0;
+                return RESULT_SUCCESS;
             case 'v':
                 print_version();
-                return 0;
+                return RESULT_SUCCESS;
             default:
-                print_usage(argv[0]);
-                return 1;
+                fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+                return RESULT_ERROR_ARGS;
         }
     }
     
-    // Get filename if provided
     if (optind < argc) {
         filename = argv[optind];
-    }
-    
-    // Open input file (or use stdin)
-    if (filename && strcmp(filename, "-") != 0) {
-        input = fopen(filename, "r");
-        if (!input) {
-            perror("Error opening input file");
-            return 1;
+        if (optind + 1 < argc) {
+            fprintf(stderr, "Error: too many arguments\n");
+            fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+            return RESULT_ERROR_ARGS;
         }
     }
     
-    // Do the conversion
-    if (decode_mode) {
-        decode_braille(input, output, text_mode);
+    // Open input file
+    if (filename == NULL || strcmp(filename, "-") == 0) {
+        input = stdin;
     } else {
-        encode_braille(input, output, text_mode);
+        input = fopen(filename, "r");
+        if (input == NULL) {
+            fprintf(stderr, "Error opening '%s': %s\n", filename, strerror(errno));
+            return RESULT_ERROR_FILE;
+        }
+    }
+    
+    // Process file
+    if (decode_mode) {
+        result = decode_braille(input, output, text_mode);
+    } else {
+        result = encode_braille(input, output, text_mode);
     }
     
     // Cleanup
-    if (input != stdin) {
-        fclose(input);
+    if (input != NULL && input != stdin) {
+        if (fclose(input) != 0) {
+            fprintf(stderr, "Warning: error closing input file: %s\n", strerror(errno));
+            if (result == RESULT_SUCCESS) {
+                result = RESULT_ERROR_FILE;
+            }
+        }
     }
     
-    return 0;
+    if (fflush(output) != 0) {
+        fprintf(stderr, "Error writing output: %s\n", strerror(errno));
+        if (result == RESULT_SUCCESS) {
+            result = RESULT_ERROR_IO;
+        }
+    }
+    
+    return (int)result;
 }
