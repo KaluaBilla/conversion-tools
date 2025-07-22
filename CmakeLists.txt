@@ -11,5 +11,6 @@ add_executable(dna dna.c)
 add_executable(morse morse.c)
 add_executable(leet leet.c)
 add_executable(dancing_man dancing_man.c)
+add_executable(factoradic factoradic.c)
 
 
