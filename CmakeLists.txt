@@ -9,3 +9,6 @@ add_executable(binary binary.c)
 add_executable(braille braille.c)
 add_executable(dna dna.c)
 add_executable(morse morse.c)
+add_executable(leet leet.c)
+
+
