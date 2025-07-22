@@ -50,15 +50,11 @@ void print_usage(const char *program_name) {
     printf("  -t, --text-braille    use text representation (dots/spaces) instead of unicode\n");
     printf("      --help           display this help and exit\n");
     printf("      --version        output version information and exit\n\n");
-    printf("Examples:\n");
-    printf("  %s file.txt          # encode text to braille\n", program_name);
-    printf("  %s -d braille.txt    # decode braille to text\n", program_name);
-    printf("  echo 'Hello' | %s -t # encode using text mode\n", program_name);
 }
 
 void print_version(void) {
-    printf("braille 2.0\n");
-    printf("Production-grade braille encoder/decoder (Grade 1 Braille)\n");
+    printf("braille 1.0\n");
+    printf("Braille encoder/decoder (Grade 1 Braille)\n");
 }
 
 static unsigned char char_to_braille(char c) {
