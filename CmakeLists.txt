@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.10)
+project(conversion-tools C)
+
+set(CMAKE_C_STANDARD 99)
+
+add_executable(ascii85 ascii85.c)
+add_executable(base85 base85.c)
+add_executable(binary binary.c)
+add_executable(braille braille.c)
+add_executable(dna dna.c)
+add_executable(morse morse.c)
